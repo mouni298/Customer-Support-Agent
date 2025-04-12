@@ -1,17 +1,16 @@
 from IPython.display import Image, display
-from typing import Annotated
+from typing import Annotated, Any, Dict, Optional
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain.chat_models import init_chat_model
-from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools.tavily_search import TavilySearchResults
 from dotenv import load_dotenv
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from langchain.tools import Tool
 from langchain_google_vertexai import VertexAIEmbeddings
 import time
 from langchain.prompts import PromptTemplate
@@ -19,18 +18,38 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.output_parsers import StrOutputParser
 from langchain.schema import Document
 from typing import List
+import os
+from database_tools import DatabaseTool
 
 load_dotenv()
 web_search_tool = TavilySearchResults(max_results=2)
 
 class GraphState(TypedDict):
-    question : str
-    generation : str
-    web_search : str
-    documents : List[str]
+    question: str
+    generation: str
+    web_search: str
+    documents: List[str]
+    db_results: Optional[List[Dict[Any, Any]]] 
 
 
 model = init_chat_model("gemini-2.0-flash", model_provider="google_vertexai")
+
+# After initializing other tools like web_search_tool
+db_uri = f"mysql+pymysql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
+db_tool = DatabaseTool(db_uri)
+
+# Create LangChain tools for database operations
+db_query_tool = Tool(
+    name="database_query",
+    description="Execute SQL queries to get information about orders and products",
+    func=db_tool.query_database
+)
+
+db_schema_tool = Tool(
+    name="database_schema",
+    description="Get database schema information for a specific table",
+    func=db_tool.get_table_schema
+)
 
 
  # Create an instance of the StateGraph, passing in the State class
@@ -62,8 +81,9 @@ prompt = PromptTemplate(
     Question: {question} 
     Context: {context} 
     Answer: <|eot_id|><|start_header_id|>assistant<|end_header_id|>""",
-    input_variables=["question", "document"],
+    input_variables=["question", "context"]
 )
+
 
 # Post-processing
 def format_docs(docs):
@@ -137,9 +157,18 @@ def generate(state):
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
+    db_results = state.get("db_results", None)
+    print(f"Documents: {documents}")
+    print(f"DB Results: {db_results}")
+    print(f"Question: {question}")
+    context = ""
+    if documents:
+        context += f"\nDocument context: {documents}"
+    if db_results:
+        context += f"\nDatabase results: {db_results}"
     
     # RAG generation
-    generation = rag_chain.invoke({"context": documents, "question": question})
+    generation = rag_chain.invoke({"context": context, "question": question})
     return {"documents": documents, "question": question, "generation": generation}
 #
 def grade_documents(state):
@@ -176,12 +205,11 @@ def grade_documents(state):
             web_search = "Yes"
             continue
     return {"documents": filtered_docs, "question": question, "web_search": web_search}
-#
 
 
 def route_question(state):
     """
-    Route question to web search or RAG.
+    Route question to web search or RAG or Orders or Products.
 
     Args:
         state (dict): The current graph state
@@ -192,15 +220,31 @@ def route_question(state):
 
     print("---ROUTE QUESTION---")
     question = state["question"]
-    print(question)
-    source = question_router.invoke({"question": question})  
-    print(source)
-    print(source['datasource'])
-    if source['datasource'] == 'web_search':
-        print("---ROUTE QUESTION TO WEB SEARCH---")
+    
+    # Update prompt to include database routing
+    router_prompt = PromptTemplate(
+        template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        You are an expert at routing user questions. Route the question to the appropriate source:
+        - Use database for questions about specific orders or product details
+        - Use vectorstore for FAQ questions about Orders & Payments, Shipping & Delivery, 
+          Offers & Membership, Seller & Product Queries, Account & Customer Support, Returns & Refunds
+        - Use web_search for general questions
+        
+        Return only: {{"datasource": "database"|"vectorstore"|"web_search"}}
+        
+        Question: {question}
+        <|eot_id|><|start_header_id|>assistant<|end_header_id|>""",
+        input_variables=["question"]
+    )
+    
+    router_chain = router_prompt | model | JsonOutputParser()
+    source = router_chain.invoke({"question": question})
+    
+    if source['datasource'] == 'database':
+        return "database"
+    elif source['datasource'] == 'web_search':
         return "websearch"
-    elif source['datasource'] == 'vectorstore':
-        print("---ROUTE QUESTION TO RAG---")
+    else:
         return "vectorstore"
 
 
@@ -230,42 +274,56 @@ def decide_to_generate(state):
         print("---DECISION: GENERATE---")
         return "generate"
     
-def grade_documents(state):
+
+def query_database(state):
     """
-    Determines whether the retrieved documents are relevant to the question
-    If any document is not relevant, we will set a flag to run web search
+    Query database for order or product information
 
     Args:
         state (dict): The current graph state
 
     Returns:
-        state (dict): Filtered out irrelevant documents and updated web_search state
+        state (dict): Updated state with database query results
     """
-
-    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
+    print("---QUERYING DATABASE---")
     question = state["question"]
-    documents = state["documents"]
     
-    # Score each doc
-    filtered_docs = []
-    web_search = "No"
-    for d in documents:
-        score = retrieval_grader.invoke({"question": question, "document": d.page_content})
-        grade = score['score']
-        # Document relevant
-        if grade.lower() == "yes":
-            print("---GRADE: DOCUMENT RELEVANT---")
-            filtered_docs.append(d)
-        # Document not relevant
-        else:
-            print("---GRADE: DOCUMENT NOT RELEVANT---")
-            # We do not include the document in filtered_docs
-            # We set a flag to indicate that we want to run web search
-            web_search = "Yes"
-            continue
-    return {"documents": filtered_docs, "question": question, "web_search": web_search}
-
-
+    # First get schema information to help with query generation
+    schema_info = db_schema_tool.run("orders, products")
+    print(f"Schema information: {schema_info}")
+    
+    # Add prompt to convert question to SQL using schema information
+    sql_prompt = PromptTemplate(
+        template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        Convert the following question into a  VALID SQL query with right syntax like 'SELECT * FROM Orders;'.
+        Available tables and their schemas:
+        {schema}
+        
+        IMPORTANT: Return ONLY the raw SQL query.
+        DO NOT include any markdown, separators, or decorators.
+        BAD: ```sql SELECT * FROM Orders; ```
+        GOOD: SELECT * FROM Orders;
+        Question: {question}
+        <|eot_id|><|start_header_id|>assistant<|end_header_id|>""",
+        input_variables=["question", "schema"]
+    )
+    
+    sql_chain = sql_prompt | model | StrOutputParser()
+    query = sql_chain.invoke({
+        "question": question,
+        "schema": schema_info
+    })
+    query = query.replace("```sql", "").replace("```", "").replace("<|file_separator|>","").strip()
+    print(f"Generated SQL query: {query}")
+    # Execute query using the db_query_tool
+    results = db_query_tool.run(query)
+    print(f"Query results: {results}")
+    
+    return {
+        "question": question,
+        "documents": state.get("documents", []),
+        "db_results": results
+    }
 
 
 def web_search_method(state):
@@ -299,11 +357,13 @@ graph_builder.add_node("websearch", web_search_method) # web search
 graph_builder.add_node("retrieve", retrieve) # retrieve
 graph_builder.add_node("grade_documents", grade_documents)
 graph_builder.add_node("generate", generate) # generatae
+graph_builder.add_node("database", query_database)
 
 
 graph_builder.set_conditional_entry_point(
     route_question,
     {
+        "database": "database",
         "websearch": "websearch",
         "vectorstore": "retrieve",
     },
@@ -319,7 +379,20 @@ graph_builder.add_conditional_edges(
     },
 )
 graph_builder.add_edge("websearch", "generate")
+graph_builder.add_edge("database", "generate")
 
 graph = graph_builder.compile()
+
+user_input = input("ask a question: ")
+
+if user_input:
+    # Add user message to chat histor
+    response = graph.invoke({
+            "question": user_input
+        })
+    print(response["generation"])
+
+
+        # Add assistant response to chat history
 
         

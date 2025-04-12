@@ -13,6 +13,7 @@ class DatabaseTool:
         try:
             with self.engine.connect() as connection:
                 result = connection.execute(text(query))
+                print(f"Executing query: {text(query)}")
                 columns = result.keys()
                 rows = result.fetchall()
                 return [dict(zip(columns, row)) for row in rows]
